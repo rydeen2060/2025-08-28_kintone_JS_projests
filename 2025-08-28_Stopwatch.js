@@ -6,15 +6,16 @@
   const MODE_FIELD = 'Timer_Mode';           // 'Stopwatch' or 'Countdown'
   const COUNTDOWN_SEC_FIELD = 'Countdown_Sec';
   const STATUS_FIELD = 'Timer_Status';       // 'ready' | 'running' | 'paused'
-  const ELAPSED_MS_FIELD = 'Elapsed_ms';     // 累積ミリ秒（停止中も保持）
-  const STARTED_AT_FIELD = 'Started_At';     // DateTime（runningの基準点）
+  const ELAPSED_MS_FIELD = 'Elapsed_ms';     // 累積ミリ秒
+  const STARTED_AT_FIELD = 'Started_At';     // DateTime（running基準点）
   const LAP_LOG_FIELD = 'Lap_Log';
 
-  // ローカルストレージキー（レコード別）
+  // レコード別ローカルキー
   const lsKey = (recordId) => `kintone_timer_${kintone.app.getId()}_${recordId || 'create'}`;
 
   // ====== ユーティリティ ======
   const pad = (n, z = 2) => String(n).padStart(z, '0');
+  const nowIso = () => new Date().toISOString();
 
   function formatMs(ms) {
     if (ms < 0) ms = 0;
@@ -23,12 +24,8 @@
     const h = Math.floor(totalSec / 3600);
     const m = Math.floor((totalSec % 3600) / 60);
     const s = totalSec % 60;
-    const cs = Math.floor((totalMs % 1000) / 10); // センチ秒(2桁)表示
+    const cs = Math.floor((totalMs % 1000) / 10); // 2桁
     return `${pad(h)}:${pad(m)}:${pad(s)}.${pad(cs)}`;
-  }
-
-  function nowIso() {
-    return new Date().toISOString();
   }
 
   function getSpaceElement(event, isMobile) {
@@ -37,7 +34,6 @@
       : kintone.app.record.getSpaceElement(SPACE_CODE);
   }
 
-  // レコード更新（停止・ラップ時などに即時保存したいとき）
   async function updateRecord(recordId, patch) {
     const app = kintone.app.getId();
     return kintone.api(kintone.api.url('/k/v1/record', true), 'PUT', {
@@ -47,7 +43,6 @@
     });
   }
 
-  // ローカルステート（描画・高頻度更新用）
   function loadLocal(recordId) {
     try {
       const raw = localStorage.getItem(lsKey(recordId));
@@ -60,11 +55,26 @@
     localStorage.setItem(lsKey(recordId), JSON.stringify(obj || {}));
   }
 
+  // ====== ランタイム状態（レコードごと）を保持する簡易レジストリ ======
+  const runtime = {
+    // recordId(string) -> state
+    map: new Map(),
+    get(recordId) { return this.map.get(recordId); },
+    set(recordId, state) { this.map.set(recordId, state); },
+    ensure(recordId) {
+      if (!this.map.has(recordId)) this.map.set(recordId, {});
+      return this.map.get(recordId);
+    }
+  };
+
   // ====== UI 作成 ======
   function renderUI({ container, event, isMobile }) {
     const record = event.record;
     const recordId = record.$id ? record.$id.value : 'create';
-    const state = {
+    const state = runtime.ensure(recordId);
+
+    // 初期化（UI参照や計測用パラメータ）
+    Object.assign(state, {
       rafId: null,
       running: false,
       displayEl: null,
@@ -72,20 +82,23 @@
       cdInputEl: null,
       startBtn: null,
       pauseBtn: null,
+      stopBtn: null,      // ★ 追加
       resetBtn: null,
       lapBtn: null,
-      lastPerfStart: 0, // performance.now() の開始点
-      baseElapsedMs: 0  // 停止中に保持している累積
-    };
+      lastPerfStart: 0,
+      baseElapsedMs: 0
+    });
 
-    // スタイル（控えめ）
+    // スタイル
     const style = document.createElement('style');
     style.textContent = `
       .ktimer-wrap { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
       .ktimer-time { font: 600 28px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .ktimer-ctrls { display:flex; gap:8px; flex-wrap:wrap; }
       .ktimer-ctrls button { padding:8px 12px; border-radius:8px; border:1px solid #ccc; cursor:pointer; }
       .ktimer-ctrls button.primary { border-color:#4f46e5; background:#4f46e5; color:#fff; }
       .ktimer-ctrls button.warn { border-color:#ef4444; background:#ef4444; color:#fff; }
+      .ktimer-ctrls button.stop { border-color:#111827; background:#111827; color:#fff; }
       .ktimer-field { display:flex; align-items:center; gap:6px; }
       .ktimer-sub { opacity:.7; font-size:12px; }
       .ktimer-row { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
@@ -106,7 +119,7 @@
     timeEl.textContent = '00:00:00.00';
     state.displayEl = timeEl;
 
-    // モード/カウントダウン秒
+    // モード/カウントダウン
     const modeCol = document.createElement('div'); modeCol.className = 'ktimer-col';
     const modeLabel = document.createElement('span'); modeLabel.textContent = 'モード:';
     const modeSel = document.createElement('select'); modeSel.className = 'ktimer-input';
@@ -119,87 +132,74 @@
 
     const cdCol = document.createElement('div'); cdCol.className = 'ktimer-col';
     const cdLabel = document.createElement('span'); cdLabel.textContent = 'カウントダウン秒:';
-    const cdInput = document.createElement('input'); cdInput.type = 'number'; cdInput.min = '0';
-    cdInput.step = '1'; cdInput.placeholder = '例: 300 (5分)';
+    const cdInput = document.createElement('input'); cdInput.type = 'number'; cdInput.min = '0'; cdInput.step = '1';
+    cdInput.placeholder = '例: 300 (5分)';
     cdInput.className = 'ktimer-input';
     cdCol.appendChild(cdLabel); cdCol.appendChild(cdInput);
     state.cdInputEl = cdInput;
 
+    // コントロール（★ 停止ボタン追加）
     const ctrls = document.createElement('div'); ctrls.className = 'ktimer-ctrls';
     const startBtn = document.createElement('button'); startBtn.className = 'primary'; startBtn.textContent = '開始 / 再開';
     const pauseBtn = document.createElement('button'); pauseBtn.textContent = '一時停止';
+    const stopBtn = document.createElement('button'); stopBtn.className = 'stop'; stopBtn.textContent = '停止';
     const resetBtn = document.createElement('button'); resetBtn.className = 'warn'; resetBtn.textContent = 'リセット';
     const lapBtn = document.createElement('button'); lapBtn.textContent = 'ラップ';
-    ctrls.appendChild(startBtn); ctrls.appendChild(pauseBtn); ctrls.appendChild(resetBtn); ctrls.appendChild(lapBtn);
-    state.startBtn = startBtn; state.pauseBtn = pauseBtn; state.resetBtn = resetBtn; state.lapBtn = lapBtn;
+    [startBtn, pauseBtn, stopBtn, resetBtn, lapBtn].forEach(b => ctrls.appendChild(b));
+    state.startBtn = startBtn; state.pauseBtn = pauseBtn; state.stopBtn = stopBtn; state.resetBtn = resetBtn; state.lapBtn = lapBtn;
 
     const subEl = document.createElement('div');
     subEl.className = 'ktimer-sub';
-    subEl.textContent = '※ 画面リロード・タブ移動に強い再計算式。保存は停止/ラップ時に自動反映。';
+    subEl.textContent = '※ 停止＝計測終了＆保存。保存時も自動で終了→結果保存します。';
 
     const row1 = document.createElement('div'); row1.className = 'ktimer-row';
     row1.appendChild(timeEl); row1.appendChild(ctrls);
     const row2 = document.createElement('div'); row2.className = 'ktimer-row';
     row2.appendChild(modeCol); row2.appendChild(cdCol);
-
-    wrap.appendChild(row1);
-    wrap.appendChild(row2);
-    wrap.appendChild(subEl);
+    wrap.appendChild(row1); wrap.appendChild(row2); wrap.appendChild(subEl);
     container.appendChild(wrap);
 
-    // ====== 状態の読み込み（レコード＋ローカル） ======
+    // ====== 状態の読み込み ======
     const recMode = (record[MODE_FIELD] && record[MODE_FIELD].value) || 'Stopwatch';
     const recCountdown = Number((record[COUNTDOWN_SEC_FIELD] && record[COUNTDOWN_SEC_FIELD].value) || 0);
     const recStatus = (record[STATUS_FIELD] && record[STATUS_FIELD].value) || 'ready';
     const recElapsed = Number((record[ELAPSED_MS_FIELD] && record[ELAPSED_MS_FIELD].value) || 0);
     const recStartedAt = (record[STARTED_AT_FIELD] && record[STARTED_AT_FIELD].value) || null;
 
-    // ローカル（表示の継続性確保）
     const local = loadLocal(recordId);
     state.baseElapsedMs = !isNaN(local.baseElapsedMs) ? local.baseElapsedMs : recElapsed;
 
     modeSel.value = local.mode || recMode;
-    cdInput.value = String(
-      !isNaN(local.countdownSec) ? local.countdownSec : recCountdown || ''
-    );
+    cdInput.value = String(!isNaN(local.countdownSec) ? local.countdownSec : recCountdown || '');
 
-    // running状態なら、基準を再構築して走らせる
+    // runningなら自動復元
     if (recStatus === 'running' && recStartedAt) {
       const startedAt = new Date(recStartedAt).getTime();
       const serverElapsed = recElapsed + (Date.now() - startedAt);
       state.baseElapsedMs = serverElapsed;
-      startTimer(); // 自動再開
+      startTimer();
     } else {
-      // 停止中表示更新
       renderDisplay(state.baseElapsedMs);
     }
 
     // ====== イベントハンドラ ======
     modeSel.addEventListener('change', () => {
-      saveLocal(recordId, {
-        ...loadLocal(recordId),
-        mode: modeSel.value
-      });
+      saveLocal(recordId, { ...loadLocal(recordId), mode: modeSel.value });
     });
     cdInput.addEventListener('input', () => {
       const v = Math.max(0, Number(cdInput.value || 0));
-      saveLocal(recordId, {
-        ...loadLocal(recordId),
-        countdownSec: v
-      });
+      saveLocal(recordId, { ...loadLocal(recordId), countdownSec: v });
     });
 
     startBtn.addEventListener('click', async () => {
       if (state.running) return;
       startTimer();
-      // サーバに状態反映（Started_At/Status）
       if (record.$id && record.$id.value) {
         await updateRecord(record.$id.value, {
           [STATUS_FIELD]: { value: 'running' },
           [STARTED_AT_FIELD]: { value: nowIso() }
         });
       } else {
-        // 新規作成画面では画面上のrecordに反映
         record[STATUS_FIELD].value = 'running';
         record[STARTED_AT_FIELD].value = nowIso();
       }
@@ -208,19 +208,19 @@
     pauseBtn.addEventListener('click', async () => {
       if (!state.running) return;
       stopTimerAndFreeze();
-      // サーバへ反映
       await saveElapsedToServer('paused');
+    });
+
+    // ★ 停止：完全終了して ready に戻す（最終値保存）
+    stopBtn.addEventListener('click', async () => {
+      finalizeStopAndSave(record);
     });
 
     resetBtn.addEventListener('click', async () => {
       stopTimerAndFreeze();
       state.baseElapsedMs = 0;
       renderDisplay(0);
-      saveLocal(recordId, {
-        ...loadLocal(recordId),
-        baseElapsedMs: 0
-      });
-      // サーバへ反映
+      saveLocal(recordId, { ...loadLocal(recordId), baseElapsedMs: 0 });
       if (record.$id && record.$id.value) {
         await updateRecord(record.$id.value, {
           [STATUS_FIELD]: { value: 'ready' },
@@ -271,17 +271,14 @@
 
     function tick() {
       renderDisplay(currentElapsed());
-
       // カウントダウン終了検知
       if (state.modeSelEl.value === 'Countdown') {
         const totalMs = Math.max(0, Number(state.cdInputEl.value || 0) * 1000);
         if (currentElapsed() >= totalMs && state.running) {
-          // 完了処理
           stopTimerAndFreeze();
-          // 軽い通知
           alert('カウントダウンが終了しました。');
-          saveElapsedToServer('paused'); // 終了値を保存
-          return; // 停止
+          saveElapsedToServer('paused');
+          return;
         }
       }
       state.rafId = requestAnimationFrame(tick);
@@ -299,10 +296,7 @@
       state.running = false;
       cancelAnimationFrame(state.rafId);
       state.baseElapsedMs = currentElapsed();
-      saveLocal(recordId, {
-        ...loadLocal(recordId),
-        baseElapsedMs: state.baseElapsedMs
-      });
+      saveLocal(recordId, { ...loadLocal(recordId), baseElapsedMs: state.baseElapsedMs });
       renderDisplay(state.baseElapsedMs);
     }
 
@@ -321,40 +315,102 @@
       }
     }
 
-    // visibilitychange でもズレ最小化（タブ復帰時に表示補正）
+    // ★ 完全停止して保存する関数（停止ボタン／保存時に利用）
+    async function finalizeStopAndSave(rec) {
+      // 走行中なら止めて最終値を確定
+      if (state.running) stopTimerAndFreeze();
+
+      // カウントダウンの場合、負の時間は0に丸める
+      if (state.modeSelEl.value === 'Countdown') {
+        const totalMs = Math.max(0, Number(state.cdInputEl.value || 0) * 1000);
+        state.baseElapsedMs = Math.min(state.baseElapsedMs, totalMs);
+        renderDisplay(state.baseElapsedMs);
+      }
+
+      const ms = Math.floor(state.baseElapsedMs);
+
+      // 既存レコードならPUT、作成/編集画面ならevent.recordへ反映
+      if (rec.$id && rec.$id.value) {
+        await updateRecord(rec.$id.value, {
+          [STATUS_FIELD]: { value: 'ready' },
+          [ELAPSED_MS_FIELD]: { value: String(ms) },
+          [STARTED_AT_FIELD]: { value: '' }
+        });
+      } else {
+        rec[STATUS_FIELD].value = 'ready';
+        rec[ELAPSED_MS_FIELD].value = String(ms);
+        rec[STARTED_AT_FIELD].value = '';
+      }
+
+      // 完全停止後はローカルも0クリア（次回はゼロから）
+      saveLocal(recordId, { ...loadLocal(recordId), baseElapsedMs: 0 });
+    }
+
+    // visibilitychange（表示補正）
     document.addEventListener('visibilitychange', () => {
       if (!state.running) return;
-      // 表示更新だけでOK（elapsedは差分計算）
       renderDisplay(currentElapsed());
     });
+
+    // state内で関数を共有（保存時フックから呼ぶため）
+    state.api = { finalizeStopAndSave, currentElapsed };
   }
 
-  // ====== 画面ごとのフック ======
-  const desktopEvents = [
-    'app.record.create.show',
-    'app.record.edit.show',
-    'app.record.detail.show'
-  ];
-  const mobileEvents = [
-    'mobile.app.record.create.show',
-    'mobile.app.record.edit.show',
-    'mobile.app.record.detail.show'
-  ];
+  // ====== 画面フック（描画） ======
+  const desktopShow = ['app.record.create.show', 'app.record.edit.show', 'app.record.detail.show'];
+  const mobileShow  = ['mobile.app.record.create.show', 'mobile.app.record.edit.show', 'mobile.app.record.detail.show'];
 
-  kintone.events.on(desktopEvents, function (event) {
+  kintone.events.on(desktopShow, function (event) {
     const el = getSpaceElement(event, false);
     if (!el) return event;
-    el.innerHTML = ''; // 再描画対策
+    el.innerHTML = '';
     renderUI({ container: el, event, isMobile: false });
     return event;
   });
 
-  kintone.events.on(mobileEvents, function (event) {
+  kintone.events.on(mobileShow, function (event) {
     const el = getSpaceElement(event, true);
     if (!el) return event;
     el.innerHTML = '';
     renderUI({ container: el, event, isMobile: true });
     return event;
   });
+
+  // ====== 保存時の自動終了（作成/編集 送信時） ======
+  const desktopSubmit = ['app.record.create.submit', 'app.record.edit.submit'];
+  const mobileSubmit  = ['mobile.app.record.create.submit', 'mobile.app.record.edit.submit'];
+
+  function submitHandler(event) {
+    try {
+      const rec = event.record;
+      const recordId = rec.$id ? rec.$id.value : 'create';
+      const state = runtime.get(recordId);
+      // UIが未描画（スペース未配置）でも、安全に動くように最低限の処理
+      if (state && state.api && typeof state.api.finalizeStopAndSave === 'function') {
+        // 送信直前に完全停止して record に最終値を反映
+        state.api.finalizeStopAndSave(rec);
+      } else {
+        // UI未描画時：Started_Atが入っていたら経過を概算する（保険）
+        const status = (rec[STATUS_FIELD] && rec[STATUS_FIELD].value) || 'ready';
+        const started = (rec[STARTED_AT_FIELD] && rec[STARTED_AT_FIELD].value) || '';
+        let elapsed = Number((rec[ELAPSED_MS_FIELD] && rec[ELAPSED_MS_FIELD].value) || 0);
+        if (status === 'running' && started) {
+          const delta = Date.now() - new Date(started).getTime();
+          if (isFinite(delta) && delta > 0) elapsed += delta;
+        }
+        // 送信直前にreadyへ
+        rec[STATUS_FIELD].value = 'ready';
+        rec[ELAPSED_MS_FIELD].value = String(Math.max(0, Math.floor(elapsed)));
+        rec[STARTED_AT_FIELD].value = '';
+      }
+    } catch (e) {
+      // 何かあっても保存ブロックはしない（値は可能な範囲で反映）
+      console.warn('[timer] submit finalize error:', e);
+    }
+    return event;
+  }
+
+  kintone.events.on(desktopSubmit, submitHandler);
+  kintone.events.on(mobileSubmit, submitHandler);
 
 })();
